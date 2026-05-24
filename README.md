@@ -5,10 +5,14 @@ A CLI tool for DNS resolution and IP/ASN enrichment.
 ## Install
 
 ```bash
-go build -o ~/.local/bin/yndns .
+curl -fsSL https://raw.githubusercontent.com/AKMYAN/yndns/main/install-binary.sh | bash
 ```
 
-Requires `~/.local/bin` in `PATH`.
+Or build from source:
+
+```bash
+go build -o ~/.local/bin/yndns .
+```
 
 ## Configure
 
