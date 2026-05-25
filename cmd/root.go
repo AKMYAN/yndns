@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -29,6 +31,8 @@ var (
 	cfg         Config
 )
 
+const maxConcurrentEnrichments = 8
+
 var rootCmd = &cobra.Command{
 	Use:   "yndns [domain|ip]",
 	Short: "DNS resolution and IP/ASN enrichment tool",
@@ -46,8 +50,11 @@ func run(cmd *cobra.Command, args []string) error {
 	if err := loadConfig(); err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	if err := validateConfig(); err != nil {
+		return err
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 	defer cancel()
 
 	enr := enricher.NewIPInfo(cfg.Token)
@@ -75,58 +82,89 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	results, err := enrichAll(ctx, enr, ips)
-	if err != nil {
-		return err
+	if len(results) > 0 {
+		formatter.PrintResults(os.Stdout, results)
 	}
-
-	formatter.PrintResults(os.Stdout, results)
-	return nil
+	return err
 }
 
 func enrichAll(ctx context.Context, enr enricher.Enricher, ips []string) ([]*enricher.Result, error) {
-	type idxResult struct {
+	type job struct {
+		idx int
+		ip  string
+	}
+	type outcome struct {
 		idx int
 		res *enricher.Result
+		err error
 	}
 
-	results := make([]*enricher.Result, len(ips))
-	ch := make(chan idxResult, len(ips))
-	errCh := make(chan error, len(ips))
-
+	jobs := make(chan job, len(ips))
 	for i, ip := range ips {
-		go func(idx int, ipAddr string) {
-			res, err := enr.Enrich(ctx, ipAddr)
-			if err != nil {
-				errCh <- fmt.Errorf("enrich %s: %w", ipAddr, err)
-				return
+		jobs <- job{idx: i, ip: ip}
+	}
+	close(jobs)
+
+	outcomes := make(chan outcome, len(ips))
+	workerCount := min(len(ips), maxConcurrentEnrichments)
+	for range workerCount {
+		go func() {
+			for item := range jobs {
+				res, err := enr.Enrich(ctx, item.ip)
+				if err != nil {
+					err = fmt.Errorf("enrich %s: %w", item.ip, err)
+				} else if res == nil {
+					err = fmt.Errorf("enrich %s: provider returned no result", item.ip)
+				}
+				outcomes <- outcome{idx: item.idx, res: res, err: err}
 			}
-			ch <- idxResult{idx: idx, res: res}
-		}(i, ip)
+		}()
 	}
 
-	received := 0
-	for received < len(ips) {
-		select {
-		case r := <-ch:
-			results[r.idx] = r.res
-			received++
-		case err := <-errCh:
-			return nil, err
+	indexed := make([]*enricher.Result, len(ips))
+	failures := make([]error, len(ips))
+	for range ips {
+		outcome := <-outcomes
+		if outcome.err != nil {
+			failures[outcome.idx] = outcome.err
+			continue
+		}
+		indexed[outcome.idx] = outcome.res
+	}
+
+	results := make([]*enricher.Result, 0, len(ips))
+	errs := make([]error, 0)
+	for i, result := range indexed {
+		if result != nil {
+			results = append(results, result)
+		}
+		if failures[i] != nil {
+			errs = append(errs, failures[i])
 		}
 	}
-
-	return results, nil
+	return results, errors.Join(errs...)
 }
 
 func loadConfig() error {
+	cfg = Config{}
 	for _, path := range configPaths() {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			continue
+			if configFile == "" && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("read %s: %w", path, err)
 		}
 		return yaml.Unmarshal(data, &cfg)
 	}
 	return nil // config file is optional
+}
+
+func validateConfig() error {
+	if strings.TrimSpace(cfg.Token) == "" {
+		return fmt.Errorf("IPInfo token is required; set token in config.yaml or use --config")
+	}
+	return nil
 }
 
 func configPaths() []string {

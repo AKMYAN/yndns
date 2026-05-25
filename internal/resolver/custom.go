@@ -3,6 +3,7 @@ package resolver
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 
@@ -15,12 +16,10 @@ type CustomResolver struct {
 }
 
 func (r *CustomResolver) Resolve(ctx context.Context, domain string) ([]string, error) {
-	server := r.Server
-	if !strings.Contains(server, ":") {
-		server = server + ":53"
+	server, err := normalizeServer(r.Server)
+	if err != nil {
+		return nil, err
 	}
-
-	c := new(dns.Client)
 
 	var (
 		ips []string
@@ -34,33 +33,14 @@ func (r *CustomResolver) Resolve(ctx context.Context, domain string) ([]string, 
 		wg.Add(1)
 		go func(qt uint16) {
 			defer wg.Done()
-			m := new(dns.Msg)
-			m.SetQuestion(dns.Fqdn(domain), qt)
-			m.RecursionDesired = true
-
-			type result struct {
-				resp *dns.Msg
-				err  error
+			resp, err := queryServer(ctx, server, domain, qt)
+			if err != nil {
+				errCh <- err
+				return
 			}
-
-			ch := make(chan result, 1)
-			go func() {
-				resp, _, err := c.Exchange(m, server)
-				ch <- result{resp, err}
-			}()
-
-			select {
-			case <-ctx.Done():
-				errCh <- ctx.Err()
-			case r := <-ch:
-				if r.err != nil {
-					errCh <- fmt.Errorf("dns query %s: %w", server, r.err)
-					return
-				}
-				mu.Lock()
-				ips = append(ips, extractIPs(r.resp)...)
-				mu.Unlock()
-			}
+			mu.Lock()
+			ips = append(ips, extractIPs(resp)...)
+			mu.Unlock()
 		}(qtype)
 	}
 
@@ -74,6 +54,51 @@ func (r *CustomResolver) Resolve(ctx context.Context, domain string) ([]string, 
 		return nil, fmt.Errorf("no records found for %s", domain)
 	}
 	return ips, nil
+}
+
+func normalizeServer(server string) (string, error) {
+	if server == "" {
+		return "", fmt.Errorf("DNS server cannot be empty")
+	}
+	if _, _, err := net.SplitHostPort(server); err == nil {
+		return server, nil
+	}
+	if net.ParseIP(server) != nil {
+		return net.JoinHostPort(server, "53"), nil
+	}
+	if strings.HasPrefix(server, "[") && strings.HasSuffix(server, "]") {
+		unbracketed := server[1 : len(server)-1]
+		if net.ParseIP(unbracketed) != nil {
+			return net.JoinHostPort(unbracketed, "53"), nil
+		}
+	}
+	if strings.Contains(server, ":") {
+		return "", fmt.Errorf("invalid DNS server %q: specify an IPv6 port as [address]:port", server)
+	}
+	return net.JoinHostPort(server, "53"), nil
+}
+
+func queryServer(ctx context.Context, server, domain string, qtype uint16) (*dns.Msg, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), qtype)
+	m.RecursionDesired = true
+
+	client := &dns.Client{Net: "udp"}
+	resp, _, err := client.ExchangeContext(ctx, m, server)
+	if err != nil {
+		return nil, fmt.Errorf("dns query %s: %w", server, err)
+	}
+	if resp.Truncated {
+		client.Net = "tcp"
+		resp, _, err = client.ExchangeContext(ctx, m, server)
+		if err != nil {
+			return nil, fmt.Errorf("dns tcp retry %s: %w", server, err)
+		}
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		return nil, fmt.Errorf("dns query %s returned %s", server, dns.RcodeToString[resp.Rcode])
+	}
+	return resp, nil
 }
 
 func extractIPs(msg *dns.Msg) []string {

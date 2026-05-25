@@ -13,8 +13,11 @@ import (
 
 // DoHResolver uses DNS-over-HTTPS.
 type DoHResolver struct {
-	Endpoint string // e.g., "https://cloudflare-dns.com/dns-query"
+	Endpoint   string // e.g., "https://cloudflare-dns.com/dns-query"
+	HTTPClient *http.Client
 }
+
+const maxDoHResponseBytes = 64 * 1024
 
 func (r *DoHResolver) Resolve(ctx context.Context, domain string) ([]string, error) {
 	var (
@@ -69,20 +72,37 @@ func (r *DoHResolver) query(ctx context.Context, domain string, qtype uint16) (*
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := r.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("doh request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("doh returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDoHResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if len(body) > maxDoHResponseBytes {
+		return nil, fmt.Errorf("doh response exceeds %d bytes", maxDoHResponseBytes)
 	}
 
 	var reply dns.Msg
 	if err := reply.Unpack(body); err != nil {
 		return nil, fmt.Errorf("unpack response: %w", err)
+	}
+	if reply.Truncated {
+		return nil, fmt.Errorf("doh response is truncated")
+	}
+	if reply.Rcode != dns.RcodeSuccess {
+		return nil, fmt.Errorf("doh returned %s", dns.RcodeToString[reply.Rcode])
 	}
 
 	return &reply, nil
