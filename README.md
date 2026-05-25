@@ -49,3 +49,7 @@ yndns --doh https://dns.quad9.net/dns-query example.com
 ```
 
 Fields: `IP  ASN  AS_NAME  AS_Domain  Country`
+
+## Outlook
+
+Support MX and NS Record.
